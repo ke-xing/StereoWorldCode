@@ -1,5 +1,5 @@
 # Ignore everything by default.
-*
+
 
 # Keep walking directories so nested Python files can be discovered.
 !*/
