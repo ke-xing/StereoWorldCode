@@ -100,4 +100,4 @@ Arguments:
 
 For dataset preparation, movie source handling, caption generation, depth annotation, and disparity annotation, see the dataset processing guide:
 
-[datasets/README.md](./datasets/README.md)
+[datasets/data.md](./datasets/data.md)
