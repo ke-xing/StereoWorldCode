@@ -1,0 +1,29 @@
+# Ignore everything by default.
+*
+
+# Keep walking directories so nested Python files can be discovered.
+!*/
+
+# Keep this ignore file and Python source files only.
+!.gitignore
+!*.py
+
+# Never track Git metadata or generated Python cache files.
+.git/
+**/.git/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Common Python/tool caches.
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+*.egg-info/
+**/*.egg-info/
