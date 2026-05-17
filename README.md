@@ -101,3 +101,14 @@ Arguments:
 For dataset preparation, movie source handling, caption generation, depth annotation, and disparity annotation, see the dataset processing guide:
 
 [datasets/data.md](./datasets/data.md)
+
+## Citation
+
+```
+@article{xing2025stereoworld,
+  title={StereoWorld: Geometry-Aware Monocular-to-Stereo Video Generation},
+  author={Xing, Ke and Jin, Xiaojie and Li, Longfei and Yin, Yuyang and Liang, Hanwen and Luo, Guixun and Fang, Chen and Wang, Jue and Plataniotis, Konstantinos N and Zhao, Yao and others},
+  journal={arXiv preprint arXiv:2512.09363},
+  year={2025}
+}
+```
