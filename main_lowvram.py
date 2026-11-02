@@ -170,6 +170,16 @@ def main():
 
     import gc
     import torch
+    device = args.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        sys.exit(
+            f"[error] PyTorch {torch.__version__} cannot use the GPU (torch.cuda.is_available() is False).\n"
+            "        Usually a CPU-only torch replaced the CUDA build (e.g. pulled in by xformers),\n"
+            "        or the NVIDIA driver is too old for this CUDA build.\n"
+            "        Fix:  pip uninstall -y xformers\n"
+            "              pip install --force-reinstall --no-deps torch torchvision "
+            "--index-url https://download.pytorch.org/whl/cu126"
+        )
     from diffsynthfinal.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
     from util import default_video_operator, preprocess_video, concat_videos_with_blending
     from lowvram.patches import apply_dit_patches
@@ -178,14 +188,6 @@ def main():
     from lowvram.sampler import emit
 
     device = args.device
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        sys.exit(
-            f"[error] PyTorch {torch.__version__} cannot use the GPU (torch.cuda.is_available() is False).\n"
-            "        Usually a CPU-only torch replaced the CUDA build (e.g. pulled in by xformers).\n"
-            "        Fix:  pip uninstall -y xformers\n"
-            "              pip install --force-reinstall --no-deps torch torchvision "
-            "--index-url https://download.pytorch.org/whl/cu126"
-        )
     out_dir = os.path.dirname(args.output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
