@@ -35,6 +35,11 @@ python main_lowvram.py --video_path test/1.mp4 --preset 6gb --prompt "a crowded 
 
 Extra dependency only for `--caption-quant`: `pip install bitsandbytes`.
 
+Windows: skip `xformers` from `requirements.txt` (it pins a torch version and
+pip then installs the CPU-only torch from PyPI). If `torch.cuda.is_available()`
+is False: `pip uninstall -y xformers` and
+`pip install --force-reinstall --no-deps torch torchvision --index-url https://download.pytorch.org/whl/cu126`.
+
 ## Where upstream spends VRAM, and what changed
 
 | Stage | Upstream `main.py` | `main_lowvram.py` |

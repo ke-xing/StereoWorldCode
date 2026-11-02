@@ -876,7 +876,7 @@ try:
             p = torch.cuda.get_device_properties(i)
             print(f'  cuda:{i} {p.name} {p.total_memory/2**30:.1f} GB')
     else:
-        print('  (!) CUDA not available - install the CUDA build of PyTorch')
+        print('  (!) CUDA not available - CPU-only torch? Fix: pip uninstall -y xformers && pip install --force-reinstall --no-deps torch torchvision --index-url https://download.pytorch.org/whl/cu126')
 except Exception as e:
     print('(!) torch:', e)
 for m in ['einops','transformers','safetensors','imageio','cv2','modelscope','moviepy','diffusers','peft','bitsandbytes','flash_attn','huggingface_hub']:
