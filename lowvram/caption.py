@@ -17,6 +17,19 @@ import tempfile
 import torch
 
 
+def _patch_bitsandbytes_for_old_transformers():
+    """transformers 4.46 (pinned by StereoWorld) calls .discard() on
+    bitsandbytes.supported_torch_devices, which bitsandbytes >= 0.46 made a
+    frozenset -> AttributeError. Give it a mutable copy."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError as e:
+        raise SystemExit("--caption-quant needs bitsandbytes: pip install \"bitsandbytes==0.45.5\"") from e
+    devs = getattr(bnb, "supported_torch_devices", None)
+    if isinstance(devs, frozenset):
+        bnb.supported_torch_devices = set(devs)
+
+
 def load_caption_model(model_dir: str, device: str, quant: str = "none"):
     from transformers import AutoModelForCausalLM, AutoProcessor
 
@@ -26,6 +39,7 @@ def load_caption_model(model_dir: str, device: str, quant: str = "none"):
     if quant in ("4bit", "8bit"):
         if not on_cuda:
             raise ValueError("--caption-quant needs a CUDA device")
+        _patch_bitsandbytes_for_old_transformers()
         from transformers import BitsAndBytesConfig
 
         if quant == "4bit":

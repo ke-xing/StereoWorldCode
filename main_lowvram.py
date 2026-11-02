@@ -182,7 +182,7 @@ def main():
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    loader = default_video_operator(enable_long_video=True, force_resolution=True, height=H, width=W,
+    loader = default_video_operator(enable_long_video=True, force_resolution=False, height=H, width=W,
                                     num_frames=SEGMENT_FRAMES, overlap_frames=OVERLAP_FRAMES)
     emit("stage", "load_video")
     segments = loader(args.video_path)
