@@ -27,3 +27,8 @@ __pycache__/
 **/.ipynb_checkpoints/
 *.egg-info/
 **/*.egg-info/
+
+gui_settings.json
+__pycache__/
+.pytest_cache/
+attention_cache.json
