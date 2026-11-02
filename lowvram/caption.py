@@ -10,11 +10,77 @@ whole generation stage after tiling. Options, cheapest first:
 """
 from __future__ import annotations
 
+import functools
 import gc
+import inspect
 import os
 import tempfile
 
 import torch
+
+CAPTION_MAX_SIDE = 448  # px; frames are downscaled before captioning
+
+
+def _has_flash_attn() -> bool:
+    try:
+        import flash_attn  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _blockwise_forward(orig_forward, hidden_states, *args, cu_seqlens=None, rotary_pos_emb=None, **kwargs):
+    """Run a varlen (cu_seqlens) vision attention one image/frame at a time.
+
+    Without flash-attn, VideoLLaMA3's SDPA path builds a dense
+    [seq x seq] mask over *all* frames of the video, which is O(seq^2) and
+    blows past any consumer GPU. Attention is block-diagonal per frame and
+    everything else in the layer is per-token, so this is exact.
+    """
+    if cu_seqlens is None or cu_seqlens.numel() <= 2:
+        return orig_forward(hidden_states, *args, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb, **kwargs)
+    bounds = cu_seqlens.tolist()
+    total = bounds[-1]
+    dim = next((d for d, n in enumerate(hidden_states.shape) if n == total), 0)
+    rdim = None
+    if rotary_pos_emb is not None:
+        rdim = next((d for d, n in enumerate(rotary_pos_emb.shape) if n == total), 0)
+    outs = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if b <= a:
+            continue
+        cs = torch.tensor([0, b - a], dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+        rp = rotary_pos_emb.narrow(rdim, a, b - a) if rotary_pos_emb is not None else None
+        outs.append(orig_forward(hidden_states.narrow(dim, a, b - a), *args,
+                                 cu_seqlens=cs, rotary_pos_emb=rp, **kwargs))
+    return torch.cat(outs, dim=dim)
+
+
+def patch_vision_attention(model) -> int:
+    """Wrap every attention module that takes `cu_seqlens` (the vision encoder)."""
+    n = 0
+    for mod in model.modules():
+        if "attention" not in type(mod).__name__.lower() or getattr(mod, "_lowvram_blockwise", False):
+            continue
+        try:
+            params = inspect.signature(mod.forward).parameters
+        except (TypeError, ValueError):
+            continue
+        if "cu_seqlens" not in params:
+            continue
+        mod.forward = functools.partial(_blockwise_forward, mod.forward)
+        mod._lowvram_blockwise = True
+        n += 1
+    return n
+
+
+def _downscale(frames, max_side=CAPTION_MAX_SIDE):
+    out = []
+    for im in frames:
+        w, h = im.size
+        s = max_side / max(w, h)
+        out.append(im.resize((max(2, int(w * s)) // 2 * 2, max(2, int(h * s)) // 2 * 2)) if s < 1 else im)
+    return out
 
 
 def _patch_bitsandbytes_for_old_transformers():
@@ -69,6 +135,9 @@ def load_caption_model(model_dir: str, device: str, quant: str = "none"):
             kwargs["attn_implementation"] = "sdpa"
     model = AutoModelForCausalLM.from_pretrained(model_dir, **kwargs)
     model.eval()
+    if not _has_flash_attn():
+        n = patch_vision_attention(model)
+        print(f"[caption] no flash-attn: vision attention runs per frame ({n} layers patched)")
     return model, processor
 
 
@@ -79,13 +148,20 @@ def caption_segment(frames, model, processor, device, fps, max_frames=180, max_n
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         path = f.name
     try:
-        save_frames_as_video(frames, path, fps=fps)
+        n = len(frames)
+        if max_frames and n > max_frames:
+            # keep the clip's duration: M evenly spaced frames at fps * M / N
+            m = max(1, max_frames)
+            idx = [round(i * (n - 1) / (m - 1)) for i in range(m)] if m > 1 else [n // 2]
+            frames = [frames[i] for i in idx]
+            fps = max(1.0, fps * m / n)
+        save_frames_as_video(_downscale(frames), path, fps=fps)
         conversation = [
             {"role": "system", "content": "You are a helpful assistant."},
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "video": {"video_path": path, "fps": fps, "max_frames": max_frames}},
+                    {"type": "video", "video": {"video_path": path, "fps": fps, "max_frames": len(frames)}},
                     {"type": "text", "text": "Describe the video."},
                 ],
             },

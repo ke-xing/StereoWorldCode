@@ -171,3 +171,46 @@ def test_frame_positions_context_manager():
     with frame_positions(d, pos):
         assert torch.equal(d.freqs[0][:6], pos)
     assert torch.equal(d.freqs[0], torch.arange(100))
+
+
+# ------------------------------------------- captioner vision attention patch
+class _DenseMaskVisionSdpaAttention(torch.nn.Module):
+    """Same structure as VideoLLaMA3/Qwen2-VL vision SDPA attention: tokens are
+    [seq, dim], a dense [1, seq, seq] block mask is built from cu_seqlens."""
+
+    def __init__(self, dim=32, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.qkv = torch.nn.Linear(dim, dim * 3)
+        self.proj = torch.nn.Linear(dim, dim)
+
+    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb=None):
+        seq = hidden_states.shape[0]
+        q, k, v = self.qkv(hidden_states).reshape(seq, 3, self.heads, -1).permute(1, 0, 2, 3)
+        if rotary_pos_emb is not None:  # simple per-token rotation stand-in
+            q = q * torch.cos(rotary_pos_emb)[:, None, :] + torch.sin(rotary_pos_emb)[:, None, :]
+            k = k * torch.cos(rotary_pos_emb)[:, None, :] - torch.sin(rotary_pos_emb)[:, None, :]
+        mask = torch.zeros([1, seq, seq], dtype=torch.bool)
+        for i in range(1, len(cu_seqlens)):
+            a, b = cu_seqlens[i - 1], cu_seqlens[i]
+            mask[..., a:b, a:b] = True
+        q, k, v = (t.transpose(0, 1) for t in (q, k, v))
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, mask)
+        return self.proj(o.transpose(0, 1).reshape(seq, -1))
+
+
+def test_vision_attention_blockwise_is_exact():
+    from lowvram.caption import patch_vision_attention
+
+    torch.manual_seed(0)
+    attn = _DenseMaskVisionSdpaAttention()
+    model = torch.nn.Sequential(attn)
+    x = torch.randn(7 + 12 + 5 + 9, 32)
+    cu = torch.tensor([0, 7, 19, 24, 33], dtype=torch.int32)
+    rope = torch.randn(33, 8)
+    with torch.no_grad():
+        ref = attn(x, cu_seqlens=cu, rotary_pos_emb=rope)
+        assert patch_vision_attention(model) == 1
+        assert patch_vision_attention(model) == 0  # idempotent
+        out = attn(x, cu_seqlens=cu, rotary_pos_emb=rope)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)

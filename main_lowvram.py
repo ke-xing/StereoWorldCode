@@ -138,7 +138,8 @@ def build_config(args, H, W, vram_gib):
     info["fits"] = info["tokens_per_call"] <= info["budget_tokens"]
 
     if args.caption_max_frames is None:
-        args.caption_max_frames = 64 if vram_gib <= 8 else 180
+        # a caption doesn't need every frame; 16 keeps the vision encoder cheap
+        args.caption_max_frames = 16
     return cfg, info, vram_gib
 
 
