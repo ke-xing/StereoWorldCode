@@ -91,6 +91,33 @@ class Job:
     message: str = ""
 
 
+def find_env_python(env: str = "stereoworld") -> str | None:
+    """Locate the python of a conda env without relying on `conda activate`."""
+    exe = "python.exe" if sys.platform == "win32" else "bin/python"
+    roots = []
+    prefix = os.environ.get("CONDA_PREFIX")
+    if prefix:
+        p = Path(prefix)
+        roots += [p.parent.parent if p.parent.name == "envs" else p]
+    home = Path.home()
+    for name in ("miniconda3", "anaconda3", "miniforge3", "mambaforge"):
+        roots += [home / name, Path(os.environ.get("LOCALAPPDATA", home)) / name,
+                  Path(os.environ.get("ProgramData", "C:/ProgramData")) / name, Path("C:/") / name]
+    for r in roots:
+        cand = r / "envs" / env / exe
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def has_module(python: str, module: str) -> bool:
+    try:
+        return subprocess.run([python, "-c", f"import {module}"], capture_output=True, timeout=60,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+    except Exception:
+        return False
+
+
 def default_output(inp: str, out_dir: str) -> str:
     p = Path(inp)
     d = Path(out_dir) if out_dir else p.parent
@@ -864,6 +891,18 @@ except Exception as e:
 
     def _detect_gpu(self):
         exe = self.python.text().strip() or sys.executable
+        if not has_module(exe, "torch"):
+            env_py = find_env_python()
+            if env_py and env_py != exe and has_module(env_py, "torch"):
+                self.python.setText(env_py)
+                self._append(f"[gui] {exe} has no PyTorch - switched to the stereoworld env: {env_py}\n", "#e5b454")
+                exe = env_py
+                self._save_settings()
+            else:
+                self._append(f"[gui] (!) {exe} has no PyTorch. Set the stereoworld env's python.exe "
+                             "in the Environment tab.\n", "#ff6b6b")
+                self.gpu_label.setText("GPU: wrong Python - see Environment tab")
+                return
         code = ("import torch\nif torch.cuda.is_available():\n p=torch.cuda.get_device_properties(0)\n"
                 " print(f'{p.name} · {p.total_memory/2**30:.1f} GB')\nelse:\n print('no CUDA GPU')")
         try:
