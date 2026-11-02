@@ -14,5 +14,18 @@ if not defined PY (
 )
 echo Using %PY%
 "%PY%" -c "import PySide6" 2>nul || "%PY%" -m pip install PySide6
+"%PY%" -c "from PySide6 import QtWidgets" 2>nul
+if errorlevel 1 (
+  echo.
+  echo PySide6 is installed but Qt cannot load ^(usually an outdated MSVC runtime in the conda env^).
+  echo Fix in the Anaconda Prompt:
+  echo   conda activate stereoworld
+  echo   conda install -c conda-forge "vc14_runtime>=14.42" -y
+  echo If that is not enough:
+  echo   pip uninstall -y PySide6 PySide6-Essentials PySide6-Addons shiboken6
+  echo   conda install -c conda-forge pyside6 -y
+  pause
+  exit /b 1
+)
 "%PY%" gui.py %*
 if errorlevel 1 pause
