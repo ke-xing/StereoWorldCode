@@ -46,7 +46,7 @@ MODELS = [
 ]
 
 STAGES = {
-    "load_video": "Reading video", "caption": "Captioning", "load_models": "Loading models",
+    "load_video": "Reading video", "attention": "Testing attention kernels", "caption": "Captioning", "load_models": "Loading models",
     "encode": "Encoding", "denoise": "Generating right eye", "decode": "Decoding",
     "write": "Writing SBS video",
 }

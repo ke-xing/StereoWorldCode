@@ -31,3 +31,4 @@ __pycache__/
 gui_settings.json
 __pycache__/
 .pytest_cache/
+attention_cache.json

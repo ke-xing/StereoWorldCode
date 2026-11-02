@@ -267,6 +267,7 @@ def main():
         pipe.enable_vram_management(vram_limit=limit, vram_buffer=0.0)
     cfg = replace(cfg, keep_dit_resident=resident, teacache=max(0.0, args.teacache))
 
+    emit("stage", "attention")
     from lowvram.attention import select as select_attention
     select_attention(args.attention, device=device, tokens=8192)
     if args.teacache > 0:

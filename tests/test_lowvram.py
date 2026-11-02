@@ -3,6 +3,7 @@ Needs only torch + einops (no models, no GPU)."""
 import importlib.util
 import os
 import sys
+import time as time_mod
 
 import pytest
 import torch
@@ -352,7 +353,7 @@ def test_teacache_tiled_equals_untiled_for_local_model(monkeypatch):
 
 
 # ----------------------------------------------------- attention selection
-def test_attention_selector_picks_fastest_correct_kernel(monkeypatch):
+def test_attention_selector_picks_fastest_correct_kernel(monkeypatch, tmp_path):
     import time as _time
     import lowvram.attention as att
 
@@ -376,6 +377,16 @@ def test_attention_selector_picks_fastest_correct_kernel(monkeypatch):
     monkeypatch.setattr(att, "_sync", lambda: None)
     _cat = att.check_and_time
     monkeypatch.setattr(att, "check_and_time", lambda fn, **kw: _cat(fn, **{**kw, "device": "cpu"}))
+    monkeypatch.setattr(att, "CACHE_FILE", tmp_path / "attention_cache.json")
+
+    def _inproc_probe(n, tokens, device, timeout=None, _cmd=None):
+        fn = att.available_kernels().get(n)
+        if fn is None:
+            return {"ok": False, "why": "not installed"}
+        sec, err = att.check_and_time(fn, tokens=tokens, device=device)
+        return {"ok": err <= att.MAX_ERR, "sec": sec, "err": err, "why": f"err {err:.3f}"}
+
+    monkeypatch.setattr(att, "probe", _inproc_probe)
     sage_mod = type(sys)("sageattention")
     sage_mod.sageattn = lambda q, k, v, **kw: fast_ok(q, k, v)
     monkeypatch.setitem(sys.modules, "sageattention", sage_mod)
@@ -393,7 +404,7 @@ def test_attention_selector_picks_fastest_correct_kernel(monkeypatch):
     assert att.select("flash3", device="cuda:0", tokens=256, verbose=False) == "sdpa"
 
 
-def test_dit_flash_attention_uses_selected_backend(monkeypatch):
+def test_dit_flash_attention_uses_selected_backend(monkeypatch, tmp_path):
     import lowvram.attention as att
 
     dit_mod = _load_dit_module()
@@ -413,8 +424,64 @@ def test_dit_flash_attention_uses_selected_backend(monkeypatch):
     monkeypatch.setattr(att, "_sync", lambda: None)
     _cat = att.check_and_time
     monkeypatch.setattr(att, "check_and_time", lambda fn, **kw: _cat(fn, **{**kw, "device": "cpu"}))
+    monkeypatch.setattr(att, "CACHE_FILE", tmp_path / "attention_cache.json")
+
+    def _inproc_probe(n, tokens, device, timeout=None, _cmd=None):
+        fn = att.available_kernels().get(n)
+        if fn is None:
+            return {"ok": False, "why": "not installed"}
+        sec, err = att.check_and_time(fn, tokens=tokens, device=device)
+        return {"ok": err <= att.MAX_ERR, "sec": sec, "err": err, "why": f"err {err:.3f}"}
+
+    monkeypatch.setattr(att, "probe", _inproc_probe)
     assert att.select("sage", device="cuda:0", tokens=64, verbose=False) == "sage"
     calls.clear()
     q = torch.randn(1, 50, 4 * 16)
     out = dit_mod.flash_attention(q, q, q, num_heads=4)
     assert calls and calls[0] == (1, 4, 50, 16) and out.shape == q.shape
+
+
+def test_attention_probe_survives_hang_and_crash(tmp_path):
+    import lowvram.attention as att
+
+    hang = tmp_path / "hang.py"
+    hang.write_text("import time; time.sleep(60)")
+    t = time_mod.time()
+    r = att.probe("sage", 64, "cuda", timeout=2, _cmd=[sys.executable, str(hang)])
+    assert not r["ok"] and "no result" in r["why"] and time_mod.time() - t < 30
+
+    crash = tmp_path / "crash.py"
+    crash.write_text("import sys; sys.stderr.write('Segfault in triton\\n'); sys.exit(139)")
+    r = att.probe("sage", 64, "cuda", timeout=20, _cmd=[sys.executable, str(crash)])
+    assert not r["ok"] and "crashed" in r["why"]
+
+    ok = tmp_path / "ok.py"
+    ok.write_text('print("noise"); print(\'@@probe {"ok": true, "sec": 0.01, "err": 0.002}\')')
+    r = att.probe("sage", 64, "cuda", timeout=20, _cmd=[sys.executable, str(ok)])
+    assert r == {"ok": True, "sec": 0.01, "err": 0.002}
+
+
+def test_attention_cache_skips_reprobe(monkeypatch, tmp_path):
+    import lowvram.attention as att
+
+    dit_mod = _load_dit_module()
+    pkg = sys.modules["diffsynthfinal.models"]
+    monkeypatch.setattr(pkg, "wan_video_dit", dit_mod, raising=False)
+    monkeypatch.setattr(att.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(att, "_sync", lambda: None)
+    monkeypatch.setattr(att, "CACHE_FILE", tmp_path / "c.json")
+    sage_mod = type(sys)("sageattention")
+    sage_mod.sageattn = lambda q, k, v, **kw: att._sdpa(q, k, v)
+    monkeypatch.setitem(sys.modules, "sageattention", sage_mod)
+    monkeypatch.setattr(att, "available_kernels", lambda: {"sdpa": att._sdpa, "sage": sage_mod.sageattn})
+    monkeypatch.setattr(att, "check_and_time", lambda fn, **kw: (0.5, 0.0))
+    probes = []
+
+    def fake_probe(n, tokens, device, timeout=None, _cmd=None):
+        probes.append(n)
+        return {"ok": True, "sec": 0.1, "err": 0.01}
+
+    monkeypatch.setattr(att, "probe", fake_probe)
+    assert att.select("auto", device="cuda:0", tokens=64, verbose=False) == "sage"
+    assert att.select("auto", device="cuda:0", tokens=64, verbose=False) == "sage"
+    assert probes == ["sage"]  # second run came from the cache
