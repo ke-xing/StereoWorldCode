@@ -22,6 +22,7 @@ is done in float32 and with proper 2-D feathering.
 from __future__ import annotations
 
 import gc
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -44,6 +45,15 @@ class LowVRAMConfig:
     overlap_latents: int = 3  # = (overlap_frames - 1) // 4 + 1 with overlap_frames = 9
     offload_finished_latents: bool = True
     verbose: bool = True
+
+
+_PROGRESS = os.environ.get("STEREOWORLD_PROGRESS") == "1"
+
+
+def emit(kind: str, *vals) -> None:
+    """Machine-readable lines for the GUI (only when STEREOWORLD_PROGRESS=1)."""
+    if _PROGRESS:
+        print("@@" + kind + " " + " ".join(str(v) for v in vals), flush=True)
 
 
 def _gpu_stats(device) -> str:
@@ -136,6 +146,7 @@ def long_video_lowvram(
         audio_sample_rate=16000, s2v_pose_video=None, audio_embeds=None,
         s2v_pose_latents=None, motion_video=None,
     )
+    emit("stage", "encode")
     for unit in pipe.units:
         inputs_shared, inputs_posi, inputs_nega = pipe.unit_runner(
             unit, pipe, inputs_shared, inputs_posi, inputs_nega
@@ -178,6 +189,7 @@ def long_video_lowvram(
     latents_all = []
     overlap_clean = None
     ov = cfg.overlap_latents
+    emit("stage", "denoise")
     for i_seg, left_latents in enumerate(tqdm(seg_latents, desc="segments")):
         t0 = time.time()
         if torch.cuda.is_available() and str(device).startswith("cuda"):
@@ -198,6 +210,7 @@ def long_video_lowvram(
             del x
             latents = pipe.scheduler.step(v, pipe.scheduler.timesteps[step_id], latents)
             del v
+            emit("progress", i_seg + 1, len(seg_latents), step_id + 1, len(pipe.scheduler.timesteps))
 
         del left_latents
         # Overlap for the next segment: decode, keep last 9 frames, re-encode (as upstream).
@@ -216,6 +229,7 @@ def long_video_lowvram(
         if cfg.verbose:
             print(f"[lowvram] segment {i_seg+1}/{len(seg_latents)} in {time.time()-t0:.0f}s  {_gpu_stats(device)}")
 
+    emit("stage", "decode")
     pipe.load_models_to_device(["vae"])
     videos = []
     for lat in latents_all:

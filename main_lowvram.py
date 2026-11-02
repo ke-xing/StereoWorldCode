@@ -121,6 +121,22 @@ def build_config(args, H, W, vram_gib):
         cfg = replace(cfg, vae_tile=(th, tw), vae_stride=(max(1, th // 2), max(1, tw // 2)))
     if args.chunk_tokens is not None:
         info["ffn_chunk_tokens"] = args.chunk_tokens
+
+    # clamp to the frame and recompute, so the plan reflects manual overrides
+    from lowvram.presets import tokens_for
+    H_lat, W_lat = H // 8, W // 8
+    th = max(2, min(cfg.tile_hw[0], H_lat) // 2 * 2)
+    tw = max(2, min(cfg.tile_hw[1], W_lat) // 2 * 2)
+    oh = min(cfg.tile_overlap_hw[0], max(0, th - 2)) // 2 * 2
+    ow = min(cfg.tile_overlap_hw[1], max(0, tw - 2)) // 2 * 2
+    cfg = replace(cfg, tile_hw=(th, tw), tile_overlap_hw=(oh, ow))
+    if cfg.t_chunk and cfg.t_chunk >= T_lat:
+        cfg = replace(cfg, t_chunk=None)
+    if cfg.t_chunk:
+        cfg = replace(cfg, t_overlap=min(cfg.t_overlap, cfg.t_chunk - 1))
+    info["tokens_per_call"] = tokens_for(cfg.t_chunk or T_lat, th, tw)
+    info["fits"] = info["tokens_per_call"] <= info["budget_tokens"]
+
     if args.caption_max_frames is None:
         args.caption_max_frames = 64 if vram_gib <= 8 else 180
     return cfg, info, vram_gib
@@ -145,7 +161,7 @@ def main():
           f"temporal window {'whole segment' if not cfg.t_chunk else f'{(cfg.t_chunk-1)*4+1} frames'}")
     print(f"[plan] {describe(tiles)}")
     print(f"[plan] tokens/call {info['tokens_per_call']:,} vs budget {info['budget_tokens']:,}"
-          f"{'' if info['fits'] else '  (!) over budget even at minimum tile; expect weight streaming / OOM'}")
+          f"{'' if info['fits'] else ('  (!) over budget - manual tile/chunk settings are too large for this VRAM' if (args.tile_size or args.temporal_chunk is not None or args.max_tokens) else '  (!) over budget even at minimum tile; expect weight streaming / OOM')}")
     print(f"[plan] VAE tile {cfg.vae_tile[1]*8}x{cfg.vae_tile[0]*8}px, chunk tokens {info['ffn_chunk_tokens']}, "
           f"DiT resident: {info['dit_resident']}, caption: "
           f"{'fixed prompt' if args.prompt else f'{args.caption_quant} on {args.caption_device or args.device}, max_frames {args.caption_max_frames}'}")
@@ -159,6 +175,7 @@ def main():
     from lowvram.patches import apply_dit_patches
     from lowvram.sampler import long_video_lowvram
     from lowvram import caption as cap
+    from lowvram.sampler import emit
 
     device = args.device
     out_dir = os.path.dirname(args.output_path)
@@ -167,12 +184,14 @@ def main():
 
     loader = default_video_operator(enable_long_video=True, force_resolution=True, height=H, width=W,
                                     num_frames=SEGMENT_FRAMES, overlap_frames=OVERLAP_FRAMES)
+    emit("stage", "load_video")
     segments = loader(args.video_path)
 
     # ---- captions ---------------------------------------------------------
     if args.prompt:
         captions = [args.prompt] * len(segments)
     else:
+        emit("stage", "caption")
         cdev = args.caption_device or device
         model, processor = cap.load_caption_model(f"{MODEL_PATH}/VideoLLaMA3-7B", cdev, args.caption_quant)
         captions = []
@@ -183,6 +202,7 @@ def main():
                 sys.exit("caption model OOM: use --caption-quant 4bit, --caption-max-frames 32, "
                          "--caption-device cpu or --prompt")
             print(f"[caption {i+1}/{len(segments)}] {c[:160]}{'...' if len(c) > 160 else ''}")
+            emit("caption", i + 1, len(segments))
             captions.append(c)
         del model, processor
         cap.free_cuda()
@@ -194,6 +214,7 @@ def main():
     gc.collect()
 
     # ---- generation -------------------------------------------------------
+    emit("stage", "load_models")
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=device,
@@ -236,9 +257,11 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
+    emit("stage", "write")
     concat_videos_with_blending(videos, segments, args.video_path, args.output_path,
                                 fps=fps, overlap_frames=OVERLAP_FRAMES)
     print(f"[done] {args.output_path}")
+    emit("done", os.path.abspath(args.output_path))
 
 
 if __name__ == "__main__":

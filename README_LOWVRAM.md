@@ -1,5 +1,23 @@
 # StereoWorld on low-VRAM GPUs
 
+## GUI: StereoWorld Studio
+
+Double-click `StereoWorld_Studio.bat` (Windows; installs PySide6 into the
+`stereoworld` env on first start) or run `python gui.py`.
+
+* **Queue**: drag videos or whole folders in; per-video output path and prompt.
+* **Show plan**: dry-run of the tiling plan for the selected video, no models loaded.
+* **Start queue / Stop**: every video runs as its own process, so an OOM or a
+  stop never takes the GUI down and VRAM is fully released between videos.
+* Live progress (stage, segment, denoising step, ETA), colour-coded log,
+  last-segment peak VRAM in the status bar, *Copy command* for the exact CLI call.
+* **Models** panel checks `models/` and downloads whatever is missing.
+* **Environment** tab: pick the Python of your conda env, check torch/CUDA,
+  packages and ffmpeg.
+* Settings and the unfinished queue are saved to `gui_settings.json`.
+
+Every GUI option maps 1:1 to a `main_lowvram.py` flag below.
+
 `main_lowvram.py` is a drop-in alternative to `main.py`. Same models, same
 LoRA, same segment/overlap scheme, same SBS output, but the memory peaks are
 restructured so it can run on 6-12 GB cards.
