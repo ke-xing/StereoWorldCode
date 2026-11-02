@@ -224,6 +224,8 @@ def main():
             captions.append(c)
         del model, processor
         cap.free_cuda()
+        from lowvram.sampler import vram_report
+        print(vram_report(device, "after freeing the captioner"), flush=True)
 
     # pixels stay on the CPU; the tiled VAE moves one tile at a time
     pixel_segments = [preprocess_video(s["frames"], device="cpu") for s in segments]
@@ -245,6 +247,19 @@ def main():
         ],
     )
     pipe.load_lora(pipe.dit, f"{MODEL_PATH}/stereo.safetensors", alpha=1)
+    # The DiT loader keeps the checkpoint's fp32 tensors (load_state_dict(assign=True)
+    # skips the bf16 cast every other model gets) and builds 10 depth-branch blocks
+    # that the RGB/stereo path never runs. The LoRA is now fused in fp32; computation
+    # was always bf16, so casting the weights once changes nothing numerically but
+    # halves their size and removes a per-layer cast on every forward pass.
+    n_depth = len(getattr(pipe.dit, "depth_blocks", []))
+    gib_before = sum(p.numel() * p.element_size() for p in pipe.dit.parameters()) / 2**30
+    if n_depth:
+        pipe.dit.depth_blocks = torch.nn.ModuleList()
+    pipe.dit.to(dtype=torch.bfloat16)
+    gib_after = sum(p.numel() * p.element_size() for p in pipe.dit.parameters()) / 2**30
+    print(f"[lowvram] DiT weights {gib_before:.2f} GiB -> {gib_after:.2f} GiB "
+          f"(bf16{f', dropped {n_depth} unused depth blocks' if n_depth else ''})")
     n = apply_dit_patches(pipe.dit, info["ffn_chunk_tokens"])
     if n:
         print(f"[lowvram] chunked attention/RoPE/FFN in {n} DiT blocks ({info['ffn_chunk_tokens']} tokens)")
@@ -267,6 +282,8 @@ def main():
         pipe.enable_vram_management(vram_limit=limit, vram_buffer=0.0)
     cfg = replace(cfg, keep_dit_resident=resident, teacache=max(0.0, args.teacache))
 
+    from lowvram.sampler import vram_report
+    print(vram_report(device, "models loaded"), flush=True)
     emit("stage", "attention")
     from lowvram.attention import select as select_attention
     select_attention(args.attention, device=device, tokens=8192)

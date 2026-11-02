@@ -702,7 +702,7 @@ class MainWindow(QMainWindow):
         self.bar_queue.setMaximum(max(1, total)); self.bar_queue.setValue(done)
         if idx is None or self.stop_requested:
             self.current = None
-            self.stage.setText("Queue finished" if idx is None else "Stopped")
+            self.stage.setText("Stopped" if self.stop_requested else "Queue finished")
             self.eta.setText("")
             self._update_buttons()
             if idx is None and self.open_when_done.isChecked():
@@ -783,6 +783,10 @@ class MainWindow(QMainWindow):
         if "error" in low or "traceback" in low or "outofmemory" in low or "out of memory" in low:
             color = "#ff6b6b"
         elif line.startswith("[plan]"):
+            color = "#9ad1ff"
+        elif "(!)" in line:
+            color = "#e5b454"
+        elif line.startswith("[vram]"):
             color = "#9ad1ff"
         elif line.startswith("[lowvram]") or line.startswith("[done]"):
             color = "#5bd18b"

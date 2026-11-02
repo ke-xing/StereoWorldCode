@@ -58,6 +58,25 @@ def emit(kind: str, *vals) -> None:
         print("@@" + kind + " " + " ".join(str(v) for v in vals), flush=True)
 
 
+def vram_report(device, label: str = "") -> str:
+    """One-line VRAM summary. `free` is device-wide (includes other apps);
+    near 0 on Windows means the driver is spilling into system RAM."""
+    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+        return ""
+    free, total = torch.cuda.mem_get_info(device)
+    alloc = torch.cuda.memory_allocated(device) / 2**30
+    res = torch.cuda.memory_reserved(device) / 2**30
+    msg = (f"[vram] {label}: torch allocated {alloc:.2f} GiB, reserved {res:.2f} GiB, "
+           f"GPU free {free / 2**30:.2f} of {total / 2**30:.1f} GiB")
+    if free / 2**30 < 0.35:
+        msg += ("\n[vram] (!) GPU memory is full. On Windows the driver then moves data to system RAM "
+                "instead of failing, which makes every step many times slower. Lower the resolution or "
+                "VRAM preset, turn off TeaCache, close GPU-heavy apps, or set NVIDIA Control Panel > "
+                "Manage 3D settings > CUDA - Sysmem Fallback Policy > Prefer No Sysmem Fallback "
+                "to get a clear out-of-memory error instead.")
+    return msg
+
+
 def _gpu_stats(device) -> str:
     if not torch.cuda.is_available() or not str(device).startswith("cuda"):
         return ""
@@ -244,6 +263,9 @@ def long_video_lowvram(
         ctx = prompts[i_seg]
         tea = _TileTeaCaches(len(pipe.scheduler.timesteps), cfg.teacache) if cfg.teacache > 0 else None
         t_steps = time.time()
+        t_last = t_steps
+        if cfg.verbose and i_seg == 0:
+            print(vram_report(device, "before first step"), flush=True)
 
         for step_id, timestep in enumerate(tqdm(pipe.scheduler.timesteps, desc=f"seg {i_seg+1}", leave=False)):
             timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=device)
@@ -256,6 +278,15 @@ def long_video_lowvram(
             del x
             latents = pipe.scheduler.step(v, pipe.scheduler.timesteps[step_id], latents)
             del v
+            if cfg.verbose:
+                if str(device).startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                now = time.time()
+                line = f"[lowvram] seg {i_seg+1} step {step_id+1}/{len(pipe.scheduler.timesteps)}: {now - t_last:.1f} s"
+                if step_id == 0 or step_id == len(pipe.scheduler.timesteps) - 1:
+                    line += "\n" + vram_report(device, "during denoising")
+                print(line, flush=True)
+                t_last = now
             emit("progress", i_seg + 1, len(seg_latents), step_id + 1, len(pipe.scheduler.timesteps))
 
         if torch.cuda.is_available() and str(device).startswith("cuda"):
