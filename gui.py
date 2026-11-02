@@ -110,9 +110,14 @@ def find_env_python(env: str = "stereoworld") -> str | None:
     return None
 
 
-def has_module(python: str, module: str) -> bool:
+REQUIRED_MODULES = ("torch", "einops", "imageio", "safetensors", "huggingface_hub")
+
+
+def python_ready(python: str) -> bool:
+    """True if `python` has the packages the pipeline and the model download need."""
+    code = "import " + ", ".join(REQUIRED_MODULES)
     try:
-        return subprocess.run([python, "-c", f"import {module}"], capture_output=True, timeout=60,
+        return subprocess.run([python, "-c", code], capture_output=True, timeout=90,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
     except Exception:
         return False
@@ -891,18 +896,19 @@ except Exception as e:
 
     def _detect_gpu(self):
         exe = self.python.text().strip() or sys.executable
-        if not has_module(exe, "torch"):
-            env_py = find_env_python()
-            if env_py and env_py != exe and has_module(env_py, "torch"):
-                self.python.setText(env_py)
-                self._append(f"[gui] {exe} has no PyTorch - switched to the stereoworld env: {env_py}\n", "#e5b454")
-                exe = env_py
-                self._save_settings()
-            else:
-                self._append(f"[gui] (!) {exe} has no PyTorch. Set the stereoworld env's python.exe "
-                             "in the Environment tab.\n", "#ff6b6b")
-                self.gpu_label.setText("GPU: wrong Python - see Environment tab")
-                return
+        env_py = find_env_python()
+        same = env_py and Path(env_py).resolve() == Path(exe).resolve()
+        if env_py and not same and not python_ready(exe):
+            # configured Python lacks the pipeline packages, the env exists: use it
+            self._append(f"[gui] {exe} is missing StereoWorld packages - switching to {env_py}\n", "#e5b454")
+            self.python.setText(env_py)
+            self._save_settings()
+            exe = env_py
+        if not python_ready(exe):
+            where = exe if (env_py and Path(env_py).resolve() == Path(exe).resolve()) else f"{exe} (no stereoworld env found)"
+            self._append(f"[gui] (!) {where} is missing packages (torch with CUDA, einops, imageio, safetensors, "
+                         "huggingface_hub). Install the requirements into the stereoworld env, then press "
+                         "'Check environment'.\n", "#ff6b6b")
         code = ("import torch\nif torch.cuda.is_available():\n p=torch.cuda.get_device_properties(0)\n"
                 " print(f'{p.name} · {p.total_memory/2**30:.1f} GB')\nelse:\n print('no CUDA GPU')")
         try:
