@@ -338,6 +338,15 @@ class MainWindow(QMainWindow):
         f.addRow("", hint("CFG 1.0 skips the negative pass and halves the time per step, at some quality cost."))
         self.seed = QSpinBox(); self.seed.setRange(0, 2**31 - 1); self.seed.setValue(0)
         f.addRow("Seed", self.seed)
+        self.attention = QComboBox(); self.attention.addItems(["auto", "sage", "flash", "flash3", "sdpa"])
+        f.addRow("Attention kernel", self.attention)
+        f.addRow("", hint("auto benchmarks the installed kernels on your GPU and uses the fastest correct one. "
+                          "SageAttention / flash-attn need to be installed - see README_LOWVRAM.md."))
+        self.teacache = QComboBox(); self.teacache.setEditable(True)
+        self.teacache.addItems(["off", "0.05  balanced", "0.08  fast", "0.12  fastest"])
+        f.addRow("TeaCache", self.teacache)
+        f.addRow("", hint("Reuses DiT results on steps where little changes. ~1.5x at 0.05, ~2x at 0.08; "
+                          "higher values soften fine detail. Combine with 30 steps for quick previews."))
         self.open_when_done = QCheckBox("Open output folder when the queue finishes")
         f.addRow("", self.open_when_done)
         return w
@@ -413,6 +422,8 @@ class MainWindow(QMainWindow):
         f.addRow("Extra arguments", self.extra_args)
         r = QHBoxLayout()
         b = QPushButton("Check environment"); b.clicked.connect(self._check_env)
+        r.addWidget(b)
+        b = QPushButton("Benchmark attention"); b.clicked.connect(self._bench_attention)
         r.addWidget(b); r.addStretch()
         f.addRow("", r)
         return w
@@ -422,6 +433,7 @@ class MainWindow(QMainWindow):
         return {
             "preset": self.preset, "res_mode": self.res_mode, "res_h": self.res_h, "res_w": self.res_w,
             "steps": self.steps, "cfg": self.cfg, "seed": self.seed, "open_when_done": self.open_when_done,
+            "attention": self.attention, "teacache": self.teacache,
             "vram_override": self.vram_override, "max_tokens": self.max_tokens, "manual_tiles": self.manual_tiles,
             "tile_w": self.tile_w, "tile_h": self.tile_h, "ov_w": self.ov_w, "ov_h": self.ov_h,
             "manual_temporal": self.manual_temporal, "t_chunk": self.t_chunk, "t_overlap": self.t_overlap,
@@ -626,6 +638,14 @@ class MainWindow(QMainWindow):
             if self.cap_frames.value() > 0:
                 a += ["--caption-max-frames", str(self.cap_frames.value())]
         a += ["--steps", str(self.steps.value()), "--cfg", f"{self.cfg.value():g}", "--seed", str(self.seed.value())]
+        a += ["--attention", self.attention.currentText()]
+        tc = self.teacache.currentText().split()[0] if self.teacache.currentText().strip() else "off"
+        if tc != "off":
+            try:
+                if float(tc) > 0:
+                    a += ["--teacache", f"{float(tc):g}"]
+            except ValueError:
+                pass
         extra = self.extra_args.text().strip()
         if extra:
             a += shlex.split(extra, posix=(sys.platform != "win32"))
@@ -879,7 +899,7 @@ try:
         print('  (!) CUDA not available - CPU-only torch? Fix: pip uninstall -y xformers && pip install --force-reinstall --no-deps torch torchvision --index-url https://download.pytorch.org/whl/cu126')
 except Exception as e:
     print('(!) torch:', e)
-for m in ['einops','transformers','safetensors','imageio','cv2','modelscope','moviepy','diffusers','peft','bitsandbytes','flash_attn','huggingface_hub']:
+for m in ['einops','transformers','safetensors','imageio','cv2','modelscope','moviepy','diffusers','peft','bitsandbytes','huggingface_hub','triton','sageattention','flash_attn']:
     try:
         mod = importlib.import_module(m); print(f'{m:16s} ok', getattr(mod, '__version__', ''))
     except Exception as e:
@@ -893,6 +913,10 @@ except Exception as e:
 """
         self.stage.setText("Checking environment…")
         self._launch(["-c", code], "env")
+
+    def _bench_attention(self):
+        self.stage.setText("Benchmarking attention kernels…")
+        self._launch(["-m", "lowvram.attention"], "env")
 
     def _detect_gpu(self):
         exe = self.python.text().strip() or sys.executable

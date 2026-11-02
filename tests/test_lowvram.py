@@ -214,3 +214,207 @@ def test_vision_attention_blockwise_is_exact():
         assert patch_vision_attention(model) == 0  # idempotent
         out = attn(x, cu_seqlens=cu, rotary_pos_emb=rope)
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+# --------------------------------------- end-to-end sampler with a fake pipe
+def _load_file_module(name, rel):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, rel))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeTeaCache:
+    """Same interface/semantics as diffsynthfinal TeaCache (skip every other step)."""
+
+    def __init__(self, steps, thresh, model_id):
+        self.step, self.steps, self.res, self.prev = 0, steps, None, None
+
+    def check(self, dit, x, t_mod):
+        skip = self.step not in (0, self.steps - 1) and self.step % 2 == 1 and self.res is not None
+        self.step = (self.step + 1) % self.steps
+        if not skip:
+            self.prev = x.clone()
+        return skip
+
+    def store(self, h):
+        self.res = h - self.prev
+
+    def update(self, h):
+        return h + self.res
+
+
+def _fake_model_fn(dit=None, latents=None, timestep=None, context=None, tea_cache=None, **kw):
+    """Tiny 'DiT': local in space, pairs right frame t with left frame t+n."""
+    n = latents.shape[2] // 2
+    x = latents
+    if tea_cache is not None and tea_cache.check(dit, x, None):
+        out = tea_cache.update(x)
+    else:
+        out = torch.tanh(x) * 0.5 + context.mean() * 0.01
+        if tea_cache is not None:
+            tea_cache.store(out)
+    out = out.clone()
+    out[:, :, :n] = out[:, :, :n] + 0.1 * latents[:, :, n:]
+    return out
+
+
+class _FakeVAE:
+    def decode(self, z, device=None, **kw):
+        b, c, t, h, w = z.shape
+        return torch.zeros(b, 3, 4 * (t - 1) + 1, h * 8, w * 8)
+
+    def encode(self, v, device=None, **kw):
+        b, c, t, h, w = v.shape
+        return torch.zeros(b, 16, (t + 3) // 4, h // 8, w // 8)
+
+
+class _FakePipe:
+    in_iteration_models = ("dit",)
+
+    def __init__(self, T, H, W, segs):
+        sched = _load_file_module("fm_sched", "diffsynthfinal/schedulers/flow_match.py")
+        self.scheduler = sched.FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
+        self.device, self.torch_dtype = "cpu", torch.float32
+        self.dit = torch.nn.Module()
+        self.dit.freqs = (torch.zeros(1024), torch.zeros(1024), torch.zeros(1024))
+        self.vae = _FakeVAE()
+        self.model_fn = _fake_model_fn
+        self.loaded = []
+        g = torch.Generator().manual_seed(0)
+        noise = torch.randn(1, 16, T, H, W, generator=g)
+        left = [torch.randn(1, 16, T, H, W, generator=g) for _ in range(segs)]
+
+        def unit(pipe, shared, posi, nega):
+            shared.update(noise=noise, input_latents=left, latents=noise)
+            posi["context"] = [torch.full((1, 4, 8), float(i)) for i in range(segs)]
+            nega["context"] = torch.zeros(1, 4, 8)
+            return shared, posi, nega
+
+        self.units = [unit]
+
+    def unit_runner(self, unit, pipe, shared, posi, nega):
+        return unit(pipe, shared, posi, nega)
+
+    def load_models_to_device(self, names):
+        self.loaded.append(tuple(names))
+
+    def vae_output_to_video(self, v):
+        return [None] * v.shape[2]
+
+
+@pytest.mark.parametrize("teacache,resident", [(0.0, False), (0.05, True)])
+def test_long_video_lowvram_runs_end_to_end(monkeypatch, teacache, resident):
+    import lowvram.sampler as smp
+
+    fake_mod = type(sys)("diffsynthfinal.pipelines.wan_video_new")
+    fake_mod.TeaCache = _FakeTeaCache
+    monkeypatch.setitem(sys.modules, "diffsynthfinal.pipelines.wan_video_new", fake_mod)
+
+    T, H, W = 21, 12, 20
+    pipe = _FakePipe(T, H, W, segs=2)
+    cfg = smp.LowVRAMConfig(tile_hw=(8, 12), tile_overlap_hw=(4, 4), teacache=teacache,
+                            keep_dit_resident=resident, verbose=True)
+    videos = smp.long_video_lowvram(pipe, prompt=["a", "b"], input_video=[None, None], cfg=cfg,
+                                    num_inference_steps=6, height=H * 8, width=W * 8)
+    assert len(videos) == 2 and len(videos[0]) == 81
+    vae_loads = [n for n in pipe.loaded if "vae" in n]
+    # between segments the DiT stays on the GPU when resident; the final decode frees it
+    assert len(vae_loads) == 3
+    assert all(("dit" in n) == resident for n in vae_loads[:-1])
+    assert "dit" not in vae_loads[-1]
+
+
+def test_teacache_tiled_equals_untiled_for_local_model(monkeypatch):
+    """With per-tile caches, tiled + TeaCache == untiled + TeaCache for a local model."""
+    import lowvram.sampler as smp
+
+    fake_mod = type(sys)("diffsynthfinal.pipelines.wan_video_new")
+    fake_mod.TeaCache = _FakeTeaCache
+    monkeypatch.setitem(sys.modules, "diffsynthfinal.pipelines.wan_video_new", fake_mod)
+
+    outs = []
+    for tile in ((12, 20), (8, 12)):
+        pipe = _FakePipe(21, 12, 20, segs=1)
+        captured = {}
+        orig_step = pipe.scheduler.step
+
+        def step(v, t, x, _o=orig_step, _c=captured):
+            _c.setdefault("v", []).append(v.clone())
+            return _o(v, t, x)
+
+        pipe.scheduler.step = step
+        cfg = smp.LowVRAMConfig(tile_hw=tile, tile_overlap_hw=(4, 4), teacache=0.05, verbose=False)
+        smp.long_video_lowvram(pipe, prompt=["a"], input_video=[None], cfg=cfg,
+                               num_inference_steps=6, height=96, width=160)
+        outs.append(torch.stack(captured["v"]))
+    torch.testing.assert_close(outs[0], outs[1], rtol=1e-5, atol=1e-5)
+
+
+# ----------------------------------------------------- attention selection
+def test_attention_selector_picks_fastest_correct_kernel(monkeypatch):
+    import time as _time
+    import lowvram.attention as att
+
+    dit_mod = _load_dit_module()  # stubbed import of the real wan_video_dit
+    monkeypatch.setitem(sys.modules, "diffsynthfinal.models.wan_video_dit", dit_mod)
+    pkg = sys.modules["diffsynthfinal.models"]
+    monkeypatch.setattr(pkg, "wan_video_dit", dit_mod, raising=False)
+
+    def slow_ok(q, k, v):
+        _time.sleep(0.02)
+        return att._sdpa(q, k, v)
+
+    def fast_wrong(q, k, v):
+        return torch.zeros_like(q)
+
+    def fast_ok(q, k, v):
+        return att._sdpa(q, k, v)
+
+    # run the "GPU" code path on CPU
+    monkeypatch.setattr(att.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(att, "_sync", lambda: None)
+    _cat = att.check_and_time
+    monkeypatch.setattr(att, "check_and_time", lambda fn, **kw: _cat(fn, **{**kw, "device": "cpu"}))
+    sage_mod = type(sys)("sageattention")
+    sage_mod.sageattn = lambda q, k, v, **kw: fast_ok(q, k, v)
+    monkeypatch.setitem(sys.modules, "sageattention", sage_mod)
+
+    monkeypatch.setattr(att, "available_kernels",
+                        lambda: {"sdpa": slow_ok, "flash": fast_wrong, "sage": fast_ok})
+    chosen = att.select("auto", device="cuda:0", tokens=256, verbose=False)
+    assert chosen == "sage"
+    assert dit_mod.SAGE_ATTN_AVAILABLE and not dit_mod.FLASH_ATTN_2_AVAILABLE and not dit_mod.FLASH_ATTN_3_AVAILABLE
+
+    # explicit request for a broken kernel falls back to sdpa
+    assert att.select("flash", device="cuda:0", tokens=256, verbose=False) == "sdpa"
+    assert not dit_mod.SAGE_ATTN_AVAILABLE and not dit_mod.FLASH_ATTN_2_AVAILABLE
+    # missing kernel falls back too
+    assert att.select("flash3", device="cuda:0", tokens=256, verbose=False) == "sdpa"
+
+
+def test_dit_flash_attention_uses_selected_backend(monkeypatch):
+    import lowvram.attention as att
+
+    dit_mod = _load_dit_module()
+    pkg = sys.modules["diffsynthfinal.models"]
+    monkeypatch.setattr(pkg, "wan_video_dit", dit_mod, raising=False)
+    calls = []
+    sage_mod = type(sys)("sageattention")
+
+    def fake_sage(q, k, v, **kw):
+        calls.append(q.shape)
+        return att._sdpa(q, k, v)
+
+    sage_mod.sageattn = fake_sage
+    monkeypatch.setitem(sys.modules, "sageattention", sage_mod)
+    monkeypatch.setattr(att, "available_kernels", lambda: {"sdpa": att._sdpa, "sage": fake_sage})
+    monkeypatch.setattr(att.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(att, "_sync", lambda: None)
+    _cat = att.check_and_time
+    monkeypatch.setattr(att, "check_and_time", lambda fn, **kw: _cat(fn, **{**kw, "device": "cpu"}))
+    assert att.select("sage", device="cuda:0", tokens=64, verbose=False) == "sage"
+    calls.clear()
+    q = torch.randn(1, 50, 4 * 16)
+    out = dit_mod.flash_attention(q, q, q, num_heads=4)
+    assert calls and calls[0] == (1, 4, 50, 16) and out.shape == q.shape

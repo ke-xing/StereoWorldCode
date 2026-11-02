@@ -40,6 +40,41 @@ pip then installs the CPU-only torch from PyPI). If `torch.cuda.is_available()`
 is False: `pip uninstall -y xformers` and
 `pip install --force-reinstall --no-deps torch torchvision --index-url https://download.pytorch.org/whl/cu126`.
 
+## Speed
+
+At 832x480 one DiT call has ~65k tokens, and self-attention is ~80% of its
+compute. In order of impact:
+
+1. **Attention kernel** (`--attention auto`, GUI: *Attention kernel*). `auto`
+   times every installed kernel on your GPU at startup, rejects any whose output
+   differs from PyTorch's, and uses the fastest. The log shows e.g.
+   `[attention] sage 9.1 ms, sdpa 24.3 ms` and `[attention] using sage`.
+   Without extra installs the DiT uses PyTorch SDPA. On Windows:
+   * **SageAttention** (usually fastest on RTX 30/40): needs Triton.
+     `pip install triton-windows` (pick the version the triton-windows README
+     lists for your torch), then either `pip install sageattention==1.0.6`
+     (Triton-only, simplest) or a SageAttention 2 wheel from
+     woct0rdho/SageAttention releases whose tags match your setup
+     (`+cu126torch<version>-cp311`).
+   * **flash-attn 2**: community Windows wheels must match Python, torch and
+     CUDA exactly (e.g. mjun0812/flash-attention-prebuild-wheels). Also used by
+     the captioner when present.
+   Check what's installed with *Environment -> Benchmark attention* or
+   `python -m lowvram.attention`. A kernel that fails its self-test is skipped,
+   never used.
+2. **TeaCache** (`--teacache 0.05`, GUI: *TeaCache*): reuses the DiT result on
+   steps where the timestep embedding barely changes. One cache per tile and
+   CFG branch, so it is correct with tiling. ~1.5x at 0.05, ~2x at 0.08; higher
+   values soften fine detail. The log reports `TeaCache skipped N/M DiT passes`.
+3. **Steps** (`--steps 30`): ~40% less time than 50, usually hard to tell apart.
+4. **CFG 1.0** halves the DiT passes (no negative prompt pass), at some quality cost.
+5. **Resolution**: tokens grow with pixels and attention with tokens squared.
+
+The DiT now stays on the GPU for the whole run when it fits (`DiT kept
+resident` in the log). Previously the offloader decided per layer at runtime
+and could end up streaming layers over PCIe on every step when other apps used
+VRAM. Each segment line now reports `s/step`.
+
 ## Where upstream spends VRAM, and what changed
 
 | Stage | Upstream `main.py` | `main_lowvram.py` |

@@ -44,6 +44,8 @@ class LowVRAMConfig:
     vae_stride: Tuple[int, int] = (15, 26)
     overlap_latents: int = 3  # = (overlap_frames - 1) // 4 + 1 with overlap_frames = 9
     offload_finished_latents: bool = True
+    keep_dit_resident: bool = False  # don't move the DiT to CPU around VAE work
+    teacache: float = 0.0  # TeaCache rel-L1 threshold; 0 = off (0.05 balanced, 0.08 fast)
     verbose: bool = True
 
 
@@ -64,6 +66,39 @@ def _gpu_stats(device) -> str:
     return f"peak alloc {peak:.2f} GiB / reserved {res:.2f} GiB"
 
 
+class _TileTeaCaches:
+    """One TeaCache per (tile, CFG branch).
+
+    TeaCache caches the DiT's residual (output - input hidden states), which
+    has the shape of the tile it was computed on, so tiles must not share one.
+    Its skip decision depends only on the timestep embedding, so all tiles
+    skip the same steps and stay consistent with each other.
+    """
+
+    def __init__(self, steps: int, thresh: float):
+        from diffsynthfinal.pipelines.wan_video_new import TeaCache
+
+        self._cls, self.steps, self.thresh = TeaCache, steps, thresh
+        self.caches = {}
+        self.calls = self.skips = 0
+
+    def get(self, key):
+        c = self.caches.get(key)
+        if c is None:
+            c = self._cls(self.steps, self.thresh, "Wan2.1-T2V-1.3B")
+            orig = c.check
+
+            def check(dit, x, t_mod, _orig=orig):
+                skip = _orig(dit, x, t_mod)
+                self.calls += 1
+                self.skips += int(bool(skip))
+                return skip
+
+            c.check = check
+            self.caches[key] = c
+        return c
+
+
 def tiled_velocity(call, x: torch.Tensor, T: int, tiles) -> torch.Tensor:
     """x: (1, C, 2T, H, W) = [right-eye latents | left-eye latents] along time.
 
@@ -75,7 +110,7 @@ def tiled_velocity(call, x: torch.Tensor, T: int, tiles) -> torch.Tensor:
     _, C, _, H, W = x.shape
     acc = torch.zeros((1, C, T, H, W), dtype=torch.float32, device=x.device)
     wsum = torch.zeros((1, 1, T, H, W), dtype=torch.float32, device=x.device)
-    for tile in tiles:
+    for i_tile, tile in enumerate(tiles):
         ts = slice(tile.t.start, tile.t.end)
         hs = slice(tile.h.start, tile.h.end)
         ws = slice(tile.w.start, tile.w.end)
@@ -90,13 +125,17 @@ def tiled_velocity(call, x: torch.Tensor, T: int, tiles) -> torch.Tensor:
                 torch.arange(tile.t.start, tile.t.end),
                 torch.arange(T + tile.t.start, T + tile.t.end),
             ])
-        v = call(sub, pos)
+        v = call(sub, pos, i_tile) if call_takes_index(call) else call(sub, pos)
         del sub
         w = tile.weight.to(x.device)
         acc[:, :, ts, hs, ws] += v[:, :, :n].float() * w
         wsum[:, :, ts, hs, ws] += w
         del v
     return (acc / wsum).to(x.dtype)
+
+
+def call_takes_index(call) -> bool:
+    return getattr(call, "_takes_tile_index", False)
 
 
 @torch.no_grad()
@@ -173,17 +212,22 @@ def long_video_lowvram(
         print(f"[lowvram] latent {T}x{H}x{W}; {describe(tiles)}")
         print(f"[lowvram] DiT tokens per call: {biggest:,} (untiled would be {tok_full:,})")
 
+    tea = None  # per-segment _TileTeaCaches
+
     def velocity(x: torch.Tensor, timestep: torch.Tensor, ctx_posi) -> torch.Tensor:
-        def call(sub, pos):
+        def call(sub, pos, idx=None):
             with frame_positions(dit, pos):
+                tc_p = tea.get((idx, "pos")) if tea else None
                 v_pos = pipe.model_fn(**models, **inputs_shared, context=ctx_posi,
-                                      latents=sub, timestep=timestep, mode="rgb")
+                                      latents=sub, timestep=timestep, mode="rgb", tea_cache=tc_p)
                 if cfg_scale == 1.0:
                     return v_pos
+                tc_n = tea.get((idx, "neg")) if tea else None
                 v_neg = pipe.model_fn(**models, **inputs_shared, context=neg_context,
-                                      latents=sub, timestep=timestep, mode="rgb")
+                                      latents=sub, timestep=timestep, mode="rgb", tea_cache=tc_n)
                 return v_neg + cfg_scale * (v_pos - v_neg)
 
+        call._takes_tile_index = True
         return tiled_velocity(call, x, T, tiles)
 
     latents_all = []
@@ -198,6 +242,8 @@ def long_video_lowvram(
         left_latents = left_latents.to(device)
         latents = noise.clone()
         ctx = prompts[i_seg]
+        tea = _TileTeaCaches(len(pipe.scheduler.timesteps), cfg.teacache) if cfg.teacache > 0 else None
+        t_steps = time.time()
 
         for step_id, timestep in enumerate(tqdm(pipe.scheduler.timesteps, desc=f"seg {i_seg+1}", leave=False)):
             timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=device)
@@ -212,9 +258,14 @@ def long_video_lowvram(
             del v
             emit("progress", i_seg + 1, len(seg_latents), step_id + 1, len(pipe.scheduler.timesteps))
 
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.synchronize(device)
+        step_time = (time.time() - t_steps) / max(1, len(pipe.scheduler.timesteps))
+        tea_note = f", TeaCache skipped {tea.skips}/{tea.calls} DiT passes" if tea else ""
         del left_latents
         # Overlap for the next segment: decode, keep last 9 frames, re-encode (as upstream).
-        pipe.load_models_to_device(["vae"])
+        vae_models = ["vae", *pipe.in_iteration_models] if cfg.keep_dit_resident else ["vae"]
+        pipe.load_models_to_device(vae_models)
         if i_seg < len(seg_latents) - 1:
             tail = pipe.vae.decode(latents, device=device, tiled=True,
                                    tile_size=cfg.vae_tile, tile_stride=cfg.vae_stride)[:, :, -(4 * (ov - 1) + 1):]
@@ -227,7 +278,8 @@ def long_video_lowvram(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if cfg.verbose:
-            print(f"[lowvram] segment {i_seg+1}/{len(seg_latents)} in {time.time()-t0:.0f}s  {_gpu_stats(device)}")
+            print(f"[lowvram] segment {i_seg+1}/{len(seg_latents)} in {time.time()-t0:.0f}s "
+                  f"({step_time:.2f} s/step{tea_note})  {_gpu_stats(device)}")
 
     emit("stage", "decode")
     pipe.load_models_to_device(["vae"])

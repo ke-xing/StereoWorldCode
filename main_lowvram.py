@@ -68,6 +68,12 @@ def parse_args():
     g.add_argument("--steps", type=int, default=50)
     g.add_argument("--cfg", type=float, default=5.0)
     g.add_argument("--seed", type=int, default=0)
+
+    g = p.add_argument_group("speed")
+    g.add_argument("--attention", default="auto", choices=["auto", "sage", "flash", "flash3", "sdpa"],
+                   help="attention kernel for the DiT; auto = benchmark installed kernels and take the fastest")
+    g.add_argument("--teacache", type=float, default=0.0,
+                   help="TeaCache threshold: 0 = off, 0.05 = balanced (~1.5x), 0.08 = fast (~2x), more = lower quality")
     return p.parse_args()
 
 
@@ -170,6 +176,7 @@ def main():
         return
 
     import gc
+    from dataclasses import replace
     import torch
     device = args.device
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -243,13 +250,27 @@ def main():
         print(f"[lowvram] chunked attention/RoPE/FFN in {n} DiT blocks ({info['ffn_chunk_tokens']} tokens)")
 
     from lowvram.presets import BYTES_PER_TOKEN
-    if args.vram_limit is not None:
-        limit = args.vram_limit
+    resident = info["dit_resident"] and args.vram_limit is None
+    if resident:
+        # Whole DiT lives on the GPU for the run: no per-layer VRAM probing,
+        # no partial streaming, no CPU round trip between segments.
+        # T5 still streams layer by layer (used once per prompt).
+        print("[lowvram] DiT kept resident on the GPU")
+        pipe.enable_vram_management(num_persistent_param_in_dit=10**12)
     else:
-        act = info["tokens_per_call"] * BYTES_PER_TOKEN / 2**30
-        limit = max(1.0, vram - act - 0.75)
-    print(f"[lowvram] weight offloader limit {limit:.1f} GiB")
-    pipe.enable_vram_management(vram_limit=limit, vram_buffer=0.0)
+        if args.vram_limit is not None:
+            limit = args.vram_limit
+        else:
+            act = info["tokens_per_call"] * BYTES_PER_TOKEN / 2**30
+            limit = max(1.0, vram - act - 0.75)
+        print(f"[lowvram] weight offloader limit {limit:.1f} GiB (DiT layers stream from RAM when over)")
+        pipe.enable_vram_management(vram_limit=limit, vram_buffer=0.0)
+    cfg = replace(cfg, keep_dit_resident=resident, teacache=max(0.0, args.teacache))
+
+    from lowvram.attention import select as select_attention
+    select_attention(args.attention, device=device, tokens=8192)
+    if args.teacache > 0:
+        print(f"[lowvram] TeaCache threshold {args.teacache:g} (per tile and CFG branch)")
 
     videos = long_video_lowvram(
         pipe,
