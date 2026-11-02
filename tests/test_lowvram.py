@@ -88,8 +88,10 @@ def test_auto_config_monotone_and_valid(vram, hw):
 
 
 def test_bigger_card_never_gets_smaller_tiles():
+    # Only among cards where the DiT stays resident: below ~5.4 GB the weights
+    # stream, which frees room for activations (bigger tiles, much slower).
     prev = 0
-    for v in (4, 6, 8, 10, 12, 16, 24):
+    for v in (6, 8, 10, 12, 16, 24):
         cfg, info = auto_config(v, 60, 108)
         assert info["tokens_per_call"] >= prev
         prev = info["tokens_per_call"]
@@ -97,6 +99,25 @@ def test_bigger_card_never_gets_smaller_tiles():
 
 # -------------------------------------------- DiT patches are exact (needs repo)
 def _load_dit_module():
+    import types
+
+    # Load the real wan_video_dit.py without importing the whole diffsynthfinal
+    # package (which pulls modelscope, transformers, ...). Its two relative
+    # imports are only used for checkpoint detection / camera control.
+    for name in ("diffsynthfinal", "diffsynthfinal.models"):
+        if name not in sys.modules:
+            pkg = types.ModuleType(name)
+            pkg.__path__ = [os.path.join(ROOT, *name.split("."))]
+            sys.modules[name] = pkg
+    if "diffsynthfinal.models.utils" not in sys.modules:
+        u = types.ModuleType("diffsynthfinal.models.utils")
+        u.hash_state_dict_keys = lambda *a, **k: ""
+        sys.modules[u.__name__] = u
+    if "diffsynthfinal.models.wan_video_camera_controller" not in sys.modules:
+        c = types.ModuleType("diffsynthfinal.models.wan_video_camera_controller")
+        c.SimpleAdapter = type("SimpleAdapter", (torch.nn.Module,), {})
+        sys.modules[c.__name__] = c
+
     path = os.path.join(ROOT, "diffsynthfinal", "models", "wan_video_dit.py")
     spec = importlib.util.spec_from_file_location("diffsynthfinal.models.wan_video_dit", path)
     mod = importlib.util.module_from_spec(spec)
