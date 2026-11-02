@@ -18,7 +18,14 @@ import tempfile
 
 import torch
 
-CAPTION_MAX_SIDE = 448  # px; frames are downscaled before captioning
+CAPTION_MAX_SIDE = 672  # px; frames are downscaled before captioning
+
+DEFAULT_QUESTION = (
+    "Describe this video in 2-4 sentences for a video generation model. Mention every person and "
+    "important object that is visible, including people at the edges of the frame, partly visible "
+    "or out-of-focus people in the foreground, and where each one is (left, right, foreground, "
+    "background). Then describe what they do, the setting, the lighting and the camera framing."
+)
 
 
 def _has_flash_attn() -> bool:
@@ -142,7 +149,8 @@ def load_caption_model(model_dir: str, device: str, quant: str = "none"):
 
 
 @torch.no_grad()
-def caption_segment(frames, model, processor, device, fps, max_frames=180, max_new_tokens=512):
+def caption_segment(frames, model, processor, device, fps, max_frames=180, max_new_tokens=512,
+                    question: str = DEFAULT_QUESTION, max_side: int = CAPTION_MAX_SIDE):
     from util import save_frames_as_video
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
@@ -155,14 +163,14 @@ def caption_segment(frames, model, processor, device, fps, max_frames=180, max_n
             idx = [round(i * (n - 1) / (m - 1)) for i in range(m)] if m > 1 else [n // 2]
             frames = [frames[i] for i in idx]
             fps = max(1.0, fps * m / n)
-        save_frames_as_video(_downscale(frames), path, fps=fps)
+        save_frames_as_video(_downscale(frames, max_side), path, fps=fps)
         conversation = [
             {"role": "system", "content": "You are a helpful assistant."},
             {
                 "role": "user",
                 "content": [
                     {"type": "video", "video": {"video_path": path, "fps": fps, "max_frames": len(frames)}},
-                    {"type": "text", "text": "Describe the video."},
+                    {"type": "text", "text": question},
                 ],
             },
         ]

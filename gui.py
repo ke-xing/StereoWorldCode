@@ -324,13 +324,20 @@ class MainWindow(QMainWindow):
         self.preset = QComboBox(); self.preset.addItems(["auto", "24gb", "16gb", "12gb", "10gb", "8gb", "6gb"])
         f.addRow("VRAM preset", self.preset)
         f.addRow("", hint("auto = use the detected VRAM of the GPU below. Pick a smaller preset if you get out-of-memory errors."))
-        self.res_mode = QComboBox(); self.res_mode.addItems(["Source (max 1080p)", "Custom"])
+        self.res_mode = QComboBox()
+        self.res_mode.addItems(["Keep aspect, short side", "Source (max 1080p)", "Custom W x H (crops to fit)"])
+        self.res_short = QSpinBox(); self.res_short.setRange(256, 2160); self.res_short.setSingleStep(16)
+        self.res_short.setValue(480); self.res_short.setSuffix(" px")
         self.res_h = QSpinBox(); self.res_h.setRange(256, 2160); self.res_h.setSingleStep(16); self.res_h.setValue(480)
         self.res_w = QSpinBox(); self.res_w.setRange(256, 3840); self.res_w.setSingleStep(16); self.res_w.setValue(832)
         self.res_mode.currentIndexChanged.connect(self._update_mode_widgets)
-        r = QHBoxLayout(); r.addWidget(self.res_mode); r.addWidget(QLabel("W")); r.addWidget(self.res_w); r.addWidget(QLabel("H")); r.addWidget(self.res_h)
+        r = QHBoxLayout(); r.addWidget(self.res_mode); r.addWidget(self.res_short)
+        self.res_wl = QLabel("Width"); self.res_hl = QLabel("Height")
+        r.addWidget(self.res_wl); r.addWidget(self.res_w); r.addWidget(self.res_hl); r.addWidget(self.res_h)
         f.addRow("Processing resolution", r)
-        f.addRow("", hint("The model was trained around 480p. Lower resolution is the biggest speed and VRAM lever; sizes are rounded to multiples of 16."))
+        f.addRow("", hint("Keep aspect: 480 turns 1920x1080 into 848x480 (the model was trained around 480p). "
+                          "Custom W x H fills that exact frame and crops whatever doesn't fit, so match the "
+                          "source's shape. Lower resolution is the biggest speed and VRAM lever."))
         self.steps = QSpinBox(); self.steps.setRange(4, 100); self.steps.setValue(50)
         f.addRow("Denoising steps", self.steps)
         self.cfg = QDoubleSpinBox(); self.cfg.setRange(1.0, 15.0); self.cfg.setSingleStep(0.5); self.cfg.setValue(5.0)
@@ -407,6 +414,17 @@ class MainWindow(QMainWindow):
         f.addRow("Captioner device", self.cap_device)
         self.cap_frames = QSpinBox(); self.cap_frames.setRange(0, 180); self.cap_frames.setSpecialValueText("auto")
         f.addRow("Max frames seen", self.cap_frames)
+        self.cap_side = QSpinBox(); self.cap_side.setRange(224, 1344); self.cap_side.setSingleStep(32)
+        self.cap_side.setValue(672); self.cap_side.setSuffix(" px")
+        f.addRow("Frame size for captioner", self.cap_side)
+        f.addRow("", hint("Longest side of the frames VideoLLaMA3 sees. Larger catches small or dark people "
+                          "at the edges, at some extra captioning time."))
+        self.cap_question = QPlainTextEdit(); self.cap_question.setFixedHeight(70)
+        self.cap_question.setPlaceholderText("default: describe every person incl. frame edges and foreground, "
+                                             "positions, actions, setting, lighting, camera framing")
+        f.addRow("Question", self.cap_question)
+        f.addRow("", hint("Captions are saved next to the output as <name>_prompts.txt - copy one into the "
+                          "video's Prompt field to correct it and re-run."))
         return w
 
     def _tab_env(self) -> QWidget:
@@ -431,7 +449,8 @@ class MainWindow(QMainWindow):
     # .............................................................. settings
     def _settings_widgets(self):
         return {
-            "preset": self.preset, "res_mode": self.res_mode, "res_h": self.res_h, "res_w": self.res_w,
+            "preset": self.preset, "res_mode": self.res_mode, "res_short": self.res_short,
+            "res_h": self.res_h, "res_w": self.res_w,
             "steps": self.steps, "cfg": self.cfg, "seed": self.seed, "open_when_done": self.open_when_done,
             "attention": self.attention, "teacache": self.teacache,
             "vram_override": self.vram_override, "max_tokens": self.max_tokens, "manual_tiles": self.manual_tiles,
@@ -439,7 +458,8 @@ class MainWindow(QMainWindow):
             "manual_temporal": self.manual_temporal, "t_chunk": self.t_chunk, "t_overlap": self.t_overlap,
             "vae_tile": self.vae_tile, "chunk_tokens": self.chunk_tokens, "vram_limit": self.vram_limit,
             "cap_mode": self.cap_mode, "global_prompt": self.global_prompt, "cap_quant": self.cap_quant,
-            "cap_device": self.cap_device, "cap_frames": self.cap_frames, "python": self.python,
+            "cap_device": self.cap_device, "cap_frames": self.cap_frames, "cap_side": self.cap_side,
+            "cap_question": self.cap_question, "python": self.python,
             "device": self.device, "extra_args": self.extra_args, "out_dir": self.out_dir,
         }
 
@@ -611,7 +631,9 @@ class MainWindow(QMainWindow):
             a += ["--vram-gb", f"{self.vram_override.value():g}"]
         if self.max_tokens.value() > 0:
             a += ["--max-tokens", str(self.max_tokens.value())]
-        if self.res_mode.currentIndex() == 1:
+        if self.res_mode.currentIndex() == 0:
+            a += ["--resolution", str(self.res_short.value() // 16 * 16)]
+        elif self.res_mode.currentIndex() == 2:
             a += ["--resolution", f"{self.res_h.value() // 16 * 16}x{self.res_w.value() // 16 * 16}"]
         if self.manual_tiles.isChecked():
             a += ["--tile-size", f"{self.tile_h.value() // 16 * 16}x{self.tile_w.value() // 16 * 16}",
@@ -637,6 +659,9 @@ class MainWindow(QMainWindow):
                 a += ["--caption-device", "cpu"]
             if self.cap_frames.value() > 0:
                 a += ["--caption-max-frames", str(self.cap_frames.value())]
+            a += ["--caption-max-side", str(self.cap_side.value())]
+            if self.cap_question.toPlainText().strip():
+                a += ["--caption-question", self.cap_question.toPlainText().strip()]
         a += ["--steps", str(self.steps.value()), "--cfg", f"{self.cfg.value():g}", "--seed", str(self.seed.value())]
         a += ["--attention", self.attention.currentText()]
         tc = self.teacache.currentText().split()[0] if self.teacache.currentText().strip() else "off"
@@ -960,8 +985,10 @@ except Exception as e:
         self.dl_btn.setEnabled(not busy and bool(self._missing_models()))
 
     def _update_mode_widgets(self):
-        custom = self.res_mode.currentIndex() == 1
-        self.res_w.setEnabled(custom); self.res_h.setEnabled(custom)
+        mode = self.res_mode.currentIndex()
+        self.res_short.setVisible(mode == 0)
+        for w in (self.res_w, self.res_h, self.res_wl, self.res_hl):
+            w.setVisible(mode == 2)
         t = self.manual_tiles.isChecked()
         for w in (self.tile_w, self.tile_h, self.ov_w, self.ov_h):
             w.setEnabled(t)
@@ -969,7 +996,7 @@ except Exception as e:
         self.t_chunk.setEnabled(tm); self.t_overlap.setEnabled(tm)
         fixed = self.cap_mode.currentIndex() == 1
         self.global_prompt.setEnabled(fixed)
-        for w in (self.cap_quant, self.cap_device, self.cap_frames):
+        for w in (self.cap_quant, self.cap_device, self.cap_frames, self.cap_side, self.cap_question):
             w.setEnabled(not fixed)
 
     def _open_output(self):

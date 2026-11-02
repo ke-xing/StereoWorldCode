@@ -5,6 +5,7 @@ import os
 import sys
 import time as time_mod
 
+import numpy as np
 import pytest
 import torch
 
@@ -485,3 +486,61 @@ def test_attention_cache_skips_reprobe(monkeypatch, tmp_path):
     assert att.select("auto", device="cuda:0", tokens=64, verbose=False) == "sage"
     assert att.select("auto", device="cuda:0", tokens=64, verbose=False) == "sage"
     assert probes == ["sage"]  # second run came from the cache
+
+
+# ------------------------------------------------- SBS output geometry
+def _util_crop_and_resize(image, H, W):
+    """Copy of util.ImageCropAndResize.crop_and_resize (util imports transformers)."""
+    import torchvision
+
+    ow, oh = image.size
+    scale = max(W / ow, H / oh)
+    image = torchvision.transforms.functional.resize(
+        image, (round(oh * scale), round(ow * scale)),
+        interpolation=torchvision.transforms.InterpolationMode.BILINEAR, antialias=True)
+    return torchvision.transforms.functional.center_crop(image, (H, W))
+
+
+@pytest.mark.parametrize("src,HW", [((1920, 1080), (480, 832)), ((1920, 1080), (864, 480)),
+                                    ((1080, 1920), (848, 480)), ((842, 474), (480, 848))])
+def test_left_eye_matches_model_input_crop(src, HW):
+    pytest.importorskip("torchvision")
+    from PIL import Image
+    from lowvram.output import cover_crop
+
+    rng = np.random.default_rng(0)
+    im = Image.fromarray(rng.integers(0, 255, (src[1], src[0], 3), dtype=np.uint8))
+    a = np.asarray(cover_crop(im, *HW))
+    b = np.asarray(_util_crop_and_resize(im, *HW))
+    assert a.shape == (HW[0], HW[1], 3)
+    assert np.array_equal(a, b)
+
+
+def test_write_sbs_end_to_end(tmp_path):
+    pytest.importorskip("imageio_ffmpeg")
+    pytest.importorskip("torchvision")
+    import imageio
+    from PIL import Image
+    from lowvram.output import write_sbs
+
+    # source: 320x180 with a white vertical bar at x=10..20 (falls in the cropped-away
+    # band when processing at 112x112 -> must NOT appear on the left eye)
+    src = tmp_path / "src.mp4"
+    w = imageio.get_writer(str(src), fps=8, quality=9, macro_block_size=8)
+    frame = np.zeros((176, 320, 3), np.uint8)
+    frame[:, 10:20] = 255
+    for _ in range(12):
+        w.append_data(frame)
+    w.close()
+
+    H, W = 112, 112
+    right = [[Image.new("RGB", (W, H), (0, 0, 255))] * 9, [Image.new("RGB", (W, H), (0, 255, 0))] * 9]
+    out = tmp_path / "sbs.mp4"
+    n = write_sbs(right, None, str(src), str(out), fps=8, overlap_frames=4, H=H, W=W)
+    assert n == 12
+    frames = [f for f in imageio.get_reader(str(out), format="ffmpeg")]  # list() trips on len()=inf
+    assert frames[0].shape == (H, 2 * W, 3)
+    left = frames[0][:, :W].astype(int)
+    assert left.max() < 60, "uncropped edge content leaked into the left eye"
+    assert frames[0][:, W:, 2].mean() > 180  # first segment (blue) on the right
+    assert frames[-1][:, W:, 1].mean() > 180  # after overlap: second segment (green)

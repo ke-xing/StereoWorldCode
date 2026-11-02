@@ -32,6 +32,14 @@ def parse_hw(s):
     return int(h), int(w)
 
 
+def parse_resolution(s):
+    """'480' -> keep the source aspect, short side 480; 'HxW' -> exact size (center crop)."""
+    s = s.strip().lower()
+    if "x" in s or "," in s:
+        return parse_hw(s)
+    return int(s)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--video_path", "--video-path", default="test/1.mp4")
@@ -54,14 +62,20 @@ def parse_args():
     g.add_argument("--vae-tile", type=parse_hw, help="VAE tile HxW in pixels, e.g. 160x272")
     g.add_argument("--chunk-tokens", type=int, help="token chunk for attention-proj/RoPE/FFN; 0 disables the patches")
     g.add_argument("--vram-limit", type=float, help="GiB the weight-offloader may fill before it starts streaming")
-    g.add_argument("--resolution", type=parse_hw,
-                   help="process at HxW (multiple of 16) instead of the source size; biggest single VRAM lever")
+    g.add_argument("--resolution", type=parse_resolution,
+                   help="'480' = keep the source aspect ratio with a 480 px short side; 'HxW' (e.g. 480x864) = "
+                        "exact size, the source is scaled to cover it and center-cropped. Biggest VRAM/speed lever")
 
     g = p.add_argument_group("captioning")
     g.add_argument("--prompt", help="use this prompt for every segment and skip VideoLLaMA3")
     g.add_argument("--caption-quant", default="none", choices=["none", "8bit", "4bit"])
     g.add_argument("--caption-device", default=None, help="e.g. cpu; default = --device")
-    g.add_argument("--caption-max-frames", type=int, default=None, help="default 180 (upstream), 64 on <=8 GB")
+    g.add_argument("--caption-max-frames", type=int, default=None,
+                   help="frames per segment shown to the captioner (default 16, evenly spaced)")
+    g.add_argument("--caption-max-side", type=int, default=672,
+                   help="longest side of the frames shown to the captioner in px (default 672)")
+    g.add_argument("--caption-question", default=None,
+                   help="what to ask VideoLLaMA3 (default asks for every person incl. frame edges/foreground)")
 
     g = p.add_argument_group("sampling")
     g.add_argument("--device", default="cuda:0")
@@ -86,6 +100,14 @@ def working_size(video_path, resolution):
     w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     fps, n = cap.get(cv2.CAP_PROP_FPS), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
+    if isinstance(resolution, int):
+        short = resolution
+        if h <= w:
+            H, W = short, w * short / h
+        else:
+            H, W = h * short / w, short
+        H, W = int(round(H / 16) * 16), int(round(W / 16) * 16)
+        return H, W, fps, n, int(w), int(h)
     if resolution:
         H, W = resolution
     else:
@@ -93,7 +115,7 @@ def working_size(video_path, resolution):
         if H * W > 1920 * 1080:  # same cap as upstream
             s = (H * W / (1920 * 1080)) ** 0.5
             H, W = int(H / s), int(W / s)
-    return H // 16 * 16, W // 16 * 16, fps, n
+    return H // 16 * 16, W // 16 * 16, fps, n, int(w), int(h)
 
 
 def detect_vram(device):
@@ -151,7 +173,7 @@ def build_config(args, H, W, vram_gib):
 
 def main():
     args = parse_args()
-    H, W, fps, n_frames = working_size(args.video_path, args.resolution)
+    H, W, fps, n_frames, src_w, src_h = working_size(args.video_path, args.resolution)
 
     vram = args.vram_gb or (None if args.preset != "auto" else detect_vram(args.device))
     if vram is None and args.preset == "auto":
@@ -163,7 +185,14 @@ def main():
 
     T_lat = (SEGMENT_FRAMES - 1) // 4 + 1
     tiles = plan_tiles(T_lat, H // 8, W // 8, cfg.tile_hw, cfg.tile_overlap_hw, cfg.t_chunk, cfg.t_overlap)
-    print(f"[plan] {W}x{H} @ {fps:.3f} fps, {n_frames} frames, VRAM budget {vram:.1f} GiB")
+    print(f"[plan] {W}x{H} @ {fps:.3f} fps, {n_frames} frames, VRAM budget {vram:.1f} GiB (source {src_w}x{src_h})")
+    from lowvram.output import crop_note
+    note = crop_note(src_w, src_h, W, H)
+    if note:
+        warn = (W > H) != (src_w > src_h) and src_w != src_h
+        print(f"[plan] {'(!) ' if warn else ''}{W}x{H} has a different shape than the source: {note}"
+              + (" - width and height swapped? Use a single number (e.g. 480) to keep the source aspect."
+                 if warn else ""))
     print(f"[plan] DiT tile {cfg.tile_hw[1]*8}x{cfg.tile_hw[0]*8}px (overlap {cfg.tile_overlap_hw[1]*8}x{cfg.tile_overlap_hw[0]*8}px), "
           f"temporal window {'whole segment' if not cfg.t_chunk else f'{(cfg.t_chunk-1)*4+1} frames'}")
     print(f"[plan] {describe(tiles)}")
@@ -215,17 +244,27 @@ def main():
         captions = []
         for i, seg in enumerate(segments):
             try:
-                c = cap.caption_segment(seg["frames"], model, processor, cdev, fps, args.caption_max_frames)
+                c = cap.caption_segment(seg["frames"], model, processor, cdev, fps, args.caption_max_frames,
+                                        question=args.caption_question or cap.DEFAULT_QUESTION,
+                                        max_side=args.caption_max_side)
             except torch.cuda.OutOfMemoryError:
                 sys.exit("caption model OOM: use --caption-quant 4bit, --caption-max-frames 32, "
                          "--caption-device cpu or --prompt")
-            print(f"[caption {i+1}/{len(segments)}] {c[:160]}{'...' if len(c) > 160 else ''}")
+            print(f"[caption {i+1}/{len(segments)}] {c}")
             emit("caption", i + 1, len(segments))
             captions.append(c)
         del model, processor
         cap.free_cuda()
         from lowvram.sampler import vram_report
         print(vram_report(device, "after freeing the captioner"), flush=True)
+
+    # keep the prompts next to the output so they can be checked / reused as --prompt
+    try:
+        with open(os.path.splitext(args.output_path)[0] + "_prompts.txt", "w", encoding="utf-8") as fh:
+            for i, (seg, c) in enumerate(zip(segments, captions)):
+                fh.write(f"# segment {i+1}: frames {seg['start_frame']}-{seg['end_frame']}\n{c}\n\n")
+    except OSError:
+        pass
 
     # pixels stay on the CPU; the tiled VAE moves one tile at a time
     pixel_segments = [preprocess_video(s["frames"], device="cpu") for s in segments]
@@ -308,8 +347,9 @@ def main():
     torch.cuda.empty_cache()
 
     emit("stage", "write")
-    concat_videos_with_blending(videos, segments, args.video_path, args.output_path,
-                                fps=fps, overlap_frames=OVERLAP_FRAMES)
+    from lowvram.output import write_sbs
+    write_sbs(videos, segments, args.video_path, args.output_path,
+              fps=fps, overlap_frames=OVERLAP_FRAMES, H=H, W=W)
     print(f"[done] {args.output_path}")
     emit("done", os.path.abspath(args.output_path))
 
